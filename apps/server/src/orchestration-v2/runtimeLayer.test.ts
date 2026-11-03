@@ -1,3 +1,4 @@
+import * as CodexAccountRecoveryWorker from "./CodexAccountRecoveryWorker.ts";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import { limitRecoveryCommand } from "./UsageLimitRecoveryWorker.ts";
@@ -9,6 +10,7 @@ import { assert, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
 import {
   type ApplicationStoredEvent,
+  type ServerProvider,
   CheckpointId,
   CheckpointRef,
   CommandId,
@@ -7807,6 +7809,314 @@ it.layer(layerSharedApplicationDataPlaneTest)("shared application data plane", (
     }),
   );
 });
+
+const accountRecoveryLayer = (scenario: string) => {
+  const snapshot = (instance: ProviderInstance, email: string): ServerProvider => ({
+    instanceId: instance.instanceId,
+    driver,
+    enabled: true,
+    installed: true,
+    version: null,
+    status: "ready",
+    auth: { status: "authenticated", type: "chatgpt", email },
+    checkedAt: "2026-11-03T12:00:00.000Z",
+    models: [
+      {
+        slug: modelSelection.model,
+        name: modelSelection.model,
+        isCustom: false,
+        capabilities: null,
+      },
+    ],
+    slashCommands: [],
+    skills: [],
+  });
+  const source = snapshot(providerInstance, "first@example.test");
+  const target = snapshot(alternateProviderInstance, "second@example.test");
+  const alternative: ServerProvider = {
+    ...target,
+    ...(scenario === "signed-out" ? { auth: { status: "unauthenticated" } } : {}),
+    ...(scenario === "same-account" ? { auth: source.auth } : {}),
+    ...(scenario === "unknown-account"
+      ? { auth: { status: "authenticated", type: "chatgpt" } }
+      : {}),
+    ...(scenario === "missing-model" ? { models: [] } : {}),
+    ...(scenario === "exhausted"
+      ? {
+          usageLimits: {
+            checkedAt: target.checkedAt,
+            windows: [{ id: "primary", label: "Session", kind: "session", usedPercent: 100 }],
+          },
+        }
+      : {}),
+  };
+  const instances = [
+    {
+      ...providerInstance,
+      snapshot: { ...providerInstance.snapshot, getSnapshot: Effect.succeed(source) },
+    },
+    {
+      ...alternateProviderInstance,
+      continuationIdentity:
+        scenario === "separate-history"
+          ? alternateProviderInstance.continuationIdentity
+          : providerInstance.continuationIdentity,
+      snapshot: { ...alternateProviderInstance.snapshot, getSnapshot: Effect.succeed(alternative) },
+    },
+  ];
+  return Layer.mergeAll(
+    RuntimeLayer.layer,
+    RuntimeLayer.layerEventSink,
+    ...(scenario === "automatic"
+      ? [CodexAccountRecoveryWorker.layer.pipe(Layer.provide(RuntimeLayer.layer))]
+      : []),
+  ).pipe(
+    Layer.provide(McpSessionRegistryTestkit.layer),
+    Layer.provide(McpProviderSessions.layer),
+    Layer.provide(SqlitePersistence.layerMemory),
+    Layer.provide(layerCheckpointStoreTest),
+    Layer.provide(layerServerConfig),
+    Layer.provide(
+      ServerSettings.layerTest({
+        projectSettingsOverrides:
+          scenario === "project-disabled"
+            ? {
+                [`account-recovery:${scenario}:project`]: {
+                  providerInstances: { [alternateInstanceId]: { enabled: false } },
+                },
+              }
+            : {},
+        providerInstances: Object.fromEntries(
+          instances.map((instance) => [
+            instance.instanceId,
+            {
+              driver: "codex",
+              enabled: !(scenario === "disabled" && instance.instanceId === alternateInstanceId),
+              config: {
+                autoSwitchAccounts:
+                  scenario !== "opted-out" &&
+                  !(scenario === "target-opted-out" && instance.instanceId === alternateInstanceId),
+              },
+            },
+          ]),
+        ),
+      }),
+    ),
+    Layer.provide(
+      Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
+        getInstance: (id) =>
+          Effect.succeed(instances.find((instance) => instance.instanceId === id)),
+        listInstances: Effect.succeed(instances),
+        listUnavailable: Effect.succeed([]),
+        streamChanges: Stream.empty,
+        subscribeChanges: Effect.never,
+      }),
+    ),
+    Layer.provide(layerGitWorkflowTest),
+    Layer.provide(layerProjectServiceTest),
+    Layer.provide(layerPlatformTest),
+  );
+};
+
+it.effect.each([
+  "compatible",
+  "automatic",
+  "opted-out",
+  "signed-out",
+  "same-account",
+  "unknown-account",
+  "target-opted-out",
+  "disabled",
+  "project-disabled",
+  "settled",
+  "stopped",
+  "missing-model",
+  "exhausted",
+  "separate-history",
+  "provider-error",
+  "archived",
+  "snoozed",
+  "stale",
+] as const)("Codex account recovery: %s", (scenario) =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const events = yield* EventSink.EventSinkV2;
+    const threadId = ThreadId.make(`account-recovery:${scenario}`);
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make(`${threadId}:create`),
+      threadId,
+      projectId: ProjectId.make(`${threadId}:project`),
+      title: "Account recovery",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: process.cwd(),
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make(`${threadId}:start`),
+      threadId,
+      messageId: MessageId.make(`${threadId}:start`),
+      text: "Start work.",
+      attachments: [],
+      dispatchMode: { type: "start_immediately" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    const initial = yield* orchestrator.getThreadProjection(threadId);
+    const [source] = initial.runs;
+    assert.isDefined(source);
+    const nativeThreadRef = {
+      driver,
+      nativeId: "native-account-recovery",
+      strength: "strong" as const,
+    };
+    const originalProviderThread = initial.providerThreads.find(
+      (thread) => thread.id === source.providerThreadId,
+    );
+    assert.isDefined(originalProviderThread);
+    yield* events.write({
+      events: [
+        {
+          id: EventId.make(`${threadId}:native-thread`),
+          type: "provider-thread.updated",
+          threadId,
+          occurredAt: yield* DateTime.now,
+          payload: { ...originalProviderThread, nativeThreadRef, status: "idle" },
+        },
+      ],
+    });
+    const fail = (run: OrchestrationV2Run) =>
+      Effect.gen(function* () {
+        const now = yield* DateTime.now;
+        yield* events.write({
+          events: [
+            {
+              id: EventId.make(`${run.id}:error`),
+              type: "turn-item.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                id: TurnItemId.make(`${run.id}:error`),
+                type: "error",
+                threadId,
+                runId: run.id,
+                nodeId: run.rootNodeId,
+                providerThreadId: run.providerThreadId,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 2,
+                status: "failed",
+                title: "Provider failure",
+                startedAt: now,
+                completedAt: now,
+                updatedAt: now,
+                failure: {
+                  class: scenario === "provider-error" ? "provider_error" : "usage_limit",
+                  message: "Plan limit reached.",
+                  code: "usageLimitExceeded",
+                  retryable: null,
+                },
+              },
+            },
+            {
+              id: EventId.make(`${run.id}:failed`),
+              type: "run.updated",
+              threadId,
+              occurredAt: now,
+              payload: { ...run, status: "failed", completedAt: now },
+            },
+          ],
+        });
+      });
+    yield* fail(source);
+    if (scenario === "archived") {
+      yield* orchestrator.dispatch({
+        type: "thread.archive",
+        commandId: CommandId.make(`${threadId}:hold`),
+        threadId,
+      });
+    }
+    if (scenario === "snoozed") {
+      yield* orchestrator.dispatch({
+        type: "thread.snooze",
+        commandId: CommandId.make(`${threadId}:hold`),
+        threadId,
+        snoozedUntil: DateTime.formatIso(DateTime.add(yield* DateTime.now, { hours: 1 })),
+      });
+    }
+    if (scenario === "settled" || scenario === "stopped") {
+      yield* orchestrator.dispatch({
+        type: scenario === "settled" ? "thread.settle" : "thread.stop",
+        commandId: CommandId.make(`${threadId}:hold`),
+        threadId,
+      });
+    }
+    if (scenario === "stale") {
+      yield* orchestrator.dispatch({
+        type: "thread.model-selection.set",
+        commandId: CommandId.make(`${threadId}:switch`),
+        threadId,
+        modelSelection: { ...modelSelection, instanceId: alternateInstanceId },
+      });
+    }
+    const recover = (runId: RunId, suffix: string) =>
+      orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`${threadId}:${suffix}`),
+        threadId,
+        messageId: MessageId.make(`${threadId}:${suffix}`),
+        codexAccountContinuationOfRunId: runId,
+        text: "Continue where you left off.",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+        createdBy: "user",
+        creationSource: "server",
+      });
+    if (scenario === "automatic") {
+      yield* events.stream({ threadId }).pipe(
+        Stream.filter(
+          (stored) =>
+            stored.event.type === "run.created" &&
+            stored.event.payload.codexAccountContinuationOfRunId === source.id,
+        ),
+        Stream.runHead,
+      );
+    } else {
+      yield* recover(source.id, "recover");
+    }
+    const after = yield* orchestrator.getThreadProjection(threadId);
+    if (scenario !== "compatible" && scenario !== "automatic") {
+      assert.lengthOf(after.runs, 1);
+      return;
+    }
+    assert.lengthOf(after.runs, 2);
+    const continuation = after.runs[1]!;
+    assert.equal(continuation.providerInstanceId, alternateInstanceId);
+    assert.deepEqual(continuation.modelSelection, {
+      ...modelSelection,
+      instanceId: alternateInstanceId,
+    });
+    assert.deepEqual(
+      after.providerThreads.find((thread) => thread.id === continuation.providerThreadId)
+        ?.nativeThreadRef,
+      nativeThreadRef,
+    );
+    assert.lengthOf(after.contextHandoffs, 0);
+    assert.equal(continuation.codexAccountContinuationOfRunId, source.id);
+    assert.equal(after.thread.providerInstanceId, alternateInstanceId);
+    yield* recover(source.id, "duplicate");
+    assert.lengthOf((yield* orchestrator.getThreadProjection(threadId)).runs, 2);
+    yield* fail(continuation);
+    yield* recover(continuation.id, "all-exhausted");
+    assert.lengthOf((yield* orchestrator.getThreadProjection(threadId)).runs, 2);
+  }).pipe(Effect.provide(accountRecoveryLayer(scenario))),
+);
 
 it.layer(layerTest)("usage-limit recovery", (it) => {
   it.effect.each(["interrupted", "usage_limit"] as const)(

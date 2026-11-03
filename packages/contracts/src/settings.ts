@@ -629,6 +629,13 @@ export function makeProviderSettingsSchema<const Fields extends Schema.Struct.Fi
 
 export const CodexSettings = makeProviderSettingsSchema(
   {
+    autoSwitchAccounts: Schema.optionalKey(Schema.Boolean).pipe(
+      Schema.annotateKey({
+        title: "Automatically switch accounts",
+        description:
+          "Continue limited threads with another compatible Codex account that also has this enabled.",
+      }),
+    ),
     setupMode: Schema.optionalKey(Schema.Literals(["managed", "existing"])).pipe(
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
@@ -679,7 +686,7 @@ export const CodexSettings = makeProviderSettingsSchema(
     ),
   },
   {
-    order: ["binaryPath", "homePath", "shadowHomePath", "launchArgs"],
+    order: ["autoSwitchAccounts", "binaryPath", "homePath", "shadowHomePath", "launchArgs"],
   },
 );
 export type CodexSettings = typeof CodexSettings.Type;
