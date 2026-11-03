@@ -63,7 +63,8 @@ export function deriveLatestContextWindowSnapshot(
 ): ContextWindowSnapshot | null {
   if (liveUsage != null) {
     const usedTokens = Math.max(0, liveUsage.usedTokens);
-    const maxTokens = liveUsage.maxTokens ?? null;
+    const maxTokens =
+      liveUsage.maxTokens != null && liveUsage.maxTokens > 0 ? liveUsage.maxTokens : null;
     const usedPercentage =
       maxTokens !== null && maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : null;
     const remainingTokens =
@@ -172,6 +173,14 @@ export function deriveLatestContextWindowSnapshot(
   }
 
   return null;
+}
+
+export function formatContextWindowPercentage(value: number | null): string | null {
+  if (value === null || !Number.isFinite(value)) return null;
+  const percentage = Math.max(0, Math.min(100, value));
+  return percentage < 10
+    ? `${percentage.toFixed(1).replace(/\.0$/, "")}%`
+    : `${Math.round(percentage)}%`;
 }
 
 export function formatContextWindowTokens(value: number | null): string {
