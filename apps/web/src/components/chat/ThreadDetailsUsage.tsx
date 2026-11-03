@@ -16,7 +16,11 @@ import type { ReactNode } from "react";
 
 import { usePrimarySettings } from "../../hooks/useSettings";
 import { useNowMinute } from "../../hooks/useNowMinute";
-import { type ContextWindowSnapshot, formatContextWindowTokens } from "../../lib/contextWindow";
+import {
+  type ContextWindowSnapshot,
+  formatContextWindowPercentage,
+  formatContextWindowTokens,
+} from "../../lib/contextWindow";
 import { cn } from "../../lib/utils";
 import { formatUpcomingTimestamp } from "../../timestampFormat";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
@@ -81,7 +85,7 @@ export function ThreadDetailsUsage({
   );
 }
 
-/** The thread's context window. The bar fills as context is used; the tick marks auto-compaction. */
+/** Context room left; the tick marks when auto-compaction is expected. */
 export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowSnapshot }) {
   const maxTokens = usage.maxTokens != null && usage.maxTokens > 0 ? usage.maxTokens : null;
   const used =
@@ -91,9 +95,10 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
   const threshold = usage.autoCompactThreshold ?? null;
   const tick =
     maxTokens !== null && threshold !== null && threshold > 0 && threshold < maxTokens
-      ? (threshold / maxTokens) * 100
+      ? (1 - threshold / maxTokens) * 100
       : null;
   const usedTokens = formatContextWindowTokens(usage.usedTokens);
+  const remainingPercentage = formatContextWindowPercentage(usage.remainingPercentage);
   return (
     <ThreadDetailsSection
       headingId="thread-details-context-heading"
@@ -103,25 +108,34 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
       <div className="grid grid-cols-[auto_minmax(3rem,1fr)_auto] gap-x-3 text-xs">
         <UsageRow
           label="Context"
-          fill={used}
+          fill={used === null ? null : 100 - used}
           tone={used === null ? null : used >= 90 ? "error" : used >= 80 ? "warning" : null}
           tick={tick}
           muted
           value={
-            maxTokens !== null
-              ? `${usedTokens} / ${formatContextWindowTokens(maxTokens)}`
-              : usedTokens
+            remainingPercentage !== null ? `${remainingPercentage} left` : `${usedTokens} used`
           }
-          ariaValue={used !== null ? `${used}% used` : `${usedTokens} tokens used`}
+          ariaValue={
+            remainingPercentage !== null
+              ? `${remainingPercentage} left`
+              : `${usedTokens} tokens used`
+          }
           tooltip={
             <>
               <span className="text-foreground">
-                {used !== null ? `Context: ${used}% used` : `Context: ${usedTokens} tokens used`}
+                {remainingPercentage !== null
+                  ? `Context: ${remainingPercentage} left`
+                  : `Context: ${usedTokens} tokens used`}
               </span>
+              {usage.remainingTokens !== null ? (
+                <span className="text-muted-foreground">
+                  {usage.remainingTokens.toLocaleString("en-US")} tokens remaining
+                </span>
+              ) : null}
               {maxTokens !== null ? (
                 <span className="text-muted-foreground">
                   {usage.usedTokens.toLocaleString("en-US")} of {maxTokens.toLocaleString("en-US")}{" "}
-                  tokens
+                  tokens used
                 </span>
               ) : null}
               {threshold !== null && threshold > 0 ? (
