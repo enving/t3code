@@ -31,6 +31,24 @@ Add another ChatGPT account in **Settings → Providers**, then select the accou
 from the thread's model picker. Compatible accounts can continue the same thread.
 Connecting accounts through T3 Code leaves your CLI login unchanged.
 
+### Automatically switch when an account runs out
+
+In **Settings → Providers**, open each Codex account, expand **Runtime**, and turn
+on **Automatically switch accounts** for the accounts you want to use together.
+Turn it off on an account to remove it from automatic switching.
+
+When a thread stops on a usage limit, T3 Code continues with another signed-in
+account that shares its Codex sessions and supports the same model. The model
+and conversation stay the same. Accounts added through T3 Code share sessions;
+for existing CLI logins, use the shared home and shadow home setup below.
+
+Each account is tried at most once per automatic continuation chain. If all
+eligible accounts run out, the thread stays stopped until you continue it or
+its configured usage-limit recovery runs. Archived, settled, snoozed, or manually
+stopped threads are not automatically switched. The switch runs on the host
+environment, so it also works when you use a remote web or mobile client. Configure
+it from web or desktop Settings.
+
 ### Multiple CLI logins
 
 A shared Codex home with a shadow home lets work and personal accounts continue
@@ -95,7 +113,8 @@ for command and file approvals.
 ## Codex says I hit a usage limit
 
 When Codex stops on a usage limit, the thread names the window that ran out and
-when it resets, when Codex reports them. Send the message again after the reset. On a workspace plan the
+when it resets, when Codex reports them. If automatic account switching is enabled, T3 Code first tries another compatible account.
+Otherwise, send the message again after the reset. On a workspace plan the
 message also says whether your workspace owner needs to add credits or raise the
 spend limit to continue sooner.
 

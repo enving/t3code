@@ -22,6 +22,7 @@ import {
   ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
   type ChatAttachment,
   CommandId,
+  CodexSettings,
   type GuestMessageId,
   isCompactionCommandMessage,
   isOrchestrationV2WorkActive,
@@ -195,6 +196,8 @@ import * as ServerSettings from "../serverSettings.ts";
 const isMessageQuestionAnswer = Schema.is(
   Schema.Union([TrimmedNonEmptyString, Schema.NonEmptyArray(TrimmedNonEmptyString)]),
 );
+
+const decodeCodexAccountSettings = Schema.decodeUnknownOption(CodexSettings);
 
 export class OrchestratorDispatchError extends Schema.TaggedError<OrchestratorDispatchError>()(
   "OrchestratorDispatchError",
@@ -5387,12 +5390,125 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     ]);
   });
 
+  const codexAccountRecoverySelection = Effect.fn("Orchestrator.codexAccountRecoverySelection")(
+    function* (projection: OrchestrationV2ThreadProjection, sourceRunId: RunId) {
+      const source = latestExecutedRun(projection.runs);
+      const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+      if (
+        source?.id !== sourceRunId ||
+        source.status !== "failed" ||
+        latestRootProviderFailure(source, projection.turnItems)?.class !== "usage_limit" ||
+        !modelSelectionsEqual(projection.thread.modelSelection, source.modelSelection) ||
+        projection.thread.archivedAt !== null ||
+        projection.thread.deletedAt !== null ||
+        projection.thread.settledOverride === "settled" ||
+        projection.runtimeRequests.some((request) => request.status === "pending") ||
+        (projection.thread.snoozedUntil != null &&
+          DateTime.toEpochMillis(projection.thread.snoozedUntil) > nowMs)
+      )
+        return undefined;
+      if (!providerAdapters.getSnapshot || !providerAdapters.getMetadata) return undefined;
+      const settings = yield* serverSettings.getSettings.pipe(Effect.orDie);
+      const optedIn = (instanceId: ProviderInstanceId) => {
+        const entry = settings.providerInstances[instanceId];
+        return (
+          entry?.driver === "codex" &&
+          resolveProjectProviderInstanceEnabled(
+            settings,
+            projection.thread.projectId,
+            instanceId,
+          ) &&
+          Option.exists(
+            decodeCodexAccountSettings(entry.config),
+            (config) => config.autoSwitchAccounts === true,
+          )
+        );
+      };
+      if (!optedIn(source.providerInstanceId)) return undefined;
+      const current = yield* providerAdapters.getSnapshot(source.providerInstanceId);
+      const metadata = yield* providerAdapters
+        .getMetadata(source.providerInstanceId)
+        .pipe(Effect.option);
+      if (
+        current?.auth.status !== "authenticated" ||
+        current.auth.type !== "chatgpt" ||
+        Option.isNone(metadata) ||
+        metadata.value.driver !== "codex"
+      )
+        return undefined;
+      // Persisted ancestry bounds retries even when usage probes are unavailable or stale.
+      const tried = new Set<ProviderInstanceId>();
+      let ancestor: OrchestrationV2Run | undefined = source;
+      while (ancestor !== undefined && !tried.has(ancestor.providerInstanceId)) {
+        tried.add(ancestor.providerInstanceId);
+        const previous: RunId | undefined = ancestor.codexAccountContinuationOfRunId;
+        ancestor =
+          previous === undefined ? undefined : projection.runs.find((run) => run.id === previous);
+      }
+      for (const instanceId of yield* providerAdapters.list()) {
+        if (tried.has(instanceId) || !optedIn(instanceId)) continue;
+        const candidateMetadata = yield* providerAdapters
+          .getMetadata(instanceId)
+          .pipe(Effect.option);
+        if (
+          Option.isNone(candidateMetadata) ||
+          candidateMetadata.value.driver !== "codex" ||
+          !candidateMetadata.value.enabled ||
+          candidateMetadata.value.continuationKey !== metadata.value.continuationKey
+        )
+          continue;
+        const candidate = yield* providerAdapters.getSnapshot(instanceId);
+        if (
+          !candidate?.enabled ||
+          !candidate.installed ||
+          candidate.status !== "ready" ||
+          candidate.auth.status !== "authenticated" ||
+          candidate.auth.type !== "chatgpt" ||
+          !candidate.models.some((model) => model.slug === source.modelSelection.model)
+        )
+          continue;
+        const currentEmail = current.auth.email?.trim().toLowerCase();
+        const candidateEmail = candidate.auth.email?.trim().toLowerCase();
+        const distinct =
+          currentEmail && candidateEmail
+            ? currentEmail !== candidateEmail
+            : current.auth.workspaceId &&
+              candidate.auth.workspaceId &&
+              current.auth.workspaceId !== candidate.auth.workspaceId;
+        if (!distinct) continue;
+        if (
+          candidate.usageLimits?.windows.some(
+            (window) =>
+              window.usedPercent >= 100 &&
+              (!window.resetsAt || Date.parse(window.resetsAt) > nowMs),
+          )
+        )
+          continue;
+        return { ...source.modelSelection, instanceId };
+      }
+      return undefined;
+    },
+  );
+
   const dispatchMessage = Effect.fn("Orchestrator.dispatchMessage")(function* (
     command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
   ) {
     let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+    if (command.codexAccountContinuationOfRunId !== undefined) {
+      if (
+        command.dispatchMode.type !== "start_immediately" ||
+        (yield* stopReachedRun(command, command.threadId, command.codexAccountContinuationOfRunId))
+      )
+        return;
+      const selection = yield* codexAccountRecoverySelection(
+        projection,
+        command.codexAccountContinuationOfRunId,
+      );
+      if (selection === undefined) return;
+      command = { ...command, modelSelection: selection };
+    }
     if (command.manualContinuationOfRunId !== undefined) {
       const source = projection.runs.find((run) => run.id === command.manualContinuationOfRunId);
       const limited = latestRootProviderFailure(source ?? null, projection.turnItems);
@@ -6047,6 +6163,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(command.restartContinuationOfRunId === undefined
           ? {}
           : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
+        ...(command.codexAccountContinuationOfRunId === undefined
+          ? {}
+          : { codexAccountContinuationOfRunId: command.codexAccountContinuationOfRunId }),
         ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
       };
       const attempt: OrchestrationV2RunAttempt = {
@@ -6435,6 +6554,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(command.restartContinuationOfRunId === undefined
           ? {}
           : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
+        ...(command.codexAccountContinuationOfRunId === undefined
+          ? {}
+          : { codexAccountContinuationOfRunId: command.codexAccountContinuationOfRunId }),
         ...(dispatchMode.type === "defer_start" && dispatchMode.workspaceStrategy !== undefined
           ? { workspacePreparation: dispatchMode.workspaceStrategy }
           : {}),
@@ -7190,6 +7312,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ...(command.restartContinuationOfRunId === undefined
         ? {}
         : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
+      ...(command.codexAccountContinuationOfRunId === undefined
+        ? {}
+        : { codexAccountContinuationOfRunId: command.codexAccountContinuationOfRunId }),
       ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
       ...wakeWorkStartedAt(projection.runs, command),
     };
@@ -13521,6 +13646,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       Effect.filterOrFail(
         (planned) =>
           planned.events.length > 0 ||
+          (command.type === "message.dispatch" &&
+            command.codexAccountContinuationOfRunId !== undefined) ||
           command.type === "thread.background-work.settle" ||
           command.type === "thread.interrupt.unresponsive" ||
           command.type === "thread.stop" ||

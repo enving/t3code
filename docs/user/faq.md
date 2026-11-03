@@ -51,11 +51,11 @@ T3 Connect is our built-in alternative to Tailscale for remote connections. If i
 
 No. We work with all of the labs and T3 Code is within the TOS of Claude Code, Codex, and Google Antigravity. We worked directly with [SpaceXAI](https://x.com/SpaceXSI/status/2070195830192320600) to collaborate on the Grok Build and Cursor integrations. Everything else uses official ACP bindings.
 
-If it works in T3 Code, you can trust it is safe.
+Automatic Codex account switching is an optional extension in this fork; the upstream integrations do not enable it.
 
 ## Can I add a bunch of accounts for one provider?
 
-I don't think T3 Code is the right place to manage a pile of accounts. If we add an auto-switcher, we are risking TOS bans for our users.
+This fork supports optional [automatic switching between compatible Codex accounts](./providers-codex.md#automatically-switch-when-an-account-runs-out). Enable it for each account you want to use. This differs from upstream T3 Code, which does not recommend automatic account switching because of possible provider account restrictions.
 
 A separate work account is fine. Setup for two: [Codex](./providers-codex.md#use-multiple-accounts) · [Claude](./providers-claude.md#separate-accounts-or-configurations). For a bigger pool, manage them outside T3 Code with a self-hosted proxy like [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). I walked through how I use 6 Claude subs and 3 Codex subs in [this video](https://www.youtube.com/watch?v=D8PikZ1KhUo), and wrote up the setup in [this guide](https://gist.github.com/t3dotgg/59a521d2ee8d70aaf90e280c175072af). Hand it to your agent and it will walk you through it. Early apologies if it gets you banned 💀 After you set up a hub, T3 Code can show its pooled limits under Usage. [Connect a hub](./usage.md#connect-a-cliproxyapi-hub)
 
